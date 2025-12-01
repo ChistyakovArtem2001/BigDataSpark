@@ -1,0 +1,151 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: pet_shop_db
+    environment:
+      POSTGRES_DB: pet_shop_dw
+      POSTGRES_USER: chistyakovartem214
+      POSTGRES_PASSWORD: passartem
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./data:/data:ro
+      - ./sql:/sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chistyakovartem214 -d pet_shop_dw"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pet_shop_network
+
+  data_loader:
+    image: python:3.11-slim
+    container_name: pet_shop_loader
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_USER: chistyakovartem214
+      DB_PASS: passartem
+      DB_NAME: pet_shop_dw
+      DB_HOST: postgres
+      DB_PORT: 5432
+    volumes:
+      - ./data:/data:ro
+      - ./sql:/sql:ro
+      - ./scripts:/scripts:ro
+    command: >
+      bash -c "
+        echo 'Установка...';
+        pip install --no-cache-dir pandas sqlalchemy psycopg2-binary > /dev/null 2>&1;
+        echo 'Готово';
+        echo '';
+        echo 'Загрузка в БД...';
+        python /scripts/load_data.py;
+        echo '';
+        echo 'Создание таблиц DDL...';
+        python /scripts/run_ddl.py;
+        echo '';
+        echo 'Заполнение данных DML...';
+        python /scripts/run_dml.py;
+        echo '';
+        echo 'ОК';
+        echo 'Подключение:';
+        echo '  Host: localhost';
+        echo '  Port: 5432';
+        echo '  Database: pet_shop_dw';
+        echo '  User: chistyakovartem214';
+        echo '  Password: passartem';
+        sleep infinity;
+      "
+    networks:
+      - pet_shop_network
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse_server
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_DB: pet_shop_analytics
+      CLICKHOUSE_USER: spark_etl
+      CLICKHOUSE_PASSWORD: spark_pass
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./init-scripts:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pet_shop_network
+
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: spark-master
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_started
+    command: >
+      bash -c "
+        export SPARK_MASTER_HOST=spark-master;
+        export SPARK_MASTER_PORT=7077;
+        /opt/spark/sbin/start-master.sh;
+        tail -f /opt/spark/logs/* 2>/dev/null
+      "
+    ports:
+      - "8081:8080"
+      - "7077:7077"
+    volumes:
+      - ./spark-apps:/opt/spark/apps:ro
+      - ./spark-jars:/opt/spark/external-jars
+    environment:
+      - CLICKHOUSE_USER=spark_etl
+      - CLICKHOUSE_PASSWORD=spark_pass
+    networks:
+      - pet_shop_network
+
+  spark-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: spark-worker
+    depends_on:
+      spark-master:
+        condition: service_started
+    command: >
+      bash -c "
+        /opt/spark/sbin/start-worker.sh spark://spark-master:7077;
+        tail -f /opt/spark/logs/* 2>/dev/null
+      "
+    volumes:
+      - ./spark-apps:/opt/spark/apps:ro
+      - ./spark-jars:/opt/spark/external-jars
+    environment:
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_CORES=2
+      - CLICKHOUSE_USER=spark_etl
+      - CLICKHOUSE_PASSWORD=spark_pass
+    networks:
+      - pet_shop_network
+
+volumes:
+  postgres_data:
+    driver: local
+  clickhouse_data:
+    driver: local
+
+networks:
+  pet_shop_network:
+    driver: bridge
